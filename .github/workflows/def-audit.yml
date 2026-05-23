@@ -1,0 +1,120 @@
+# Stage 1: warn-only
+#
+# DEF-* convention audit — runs the S2Forge predicate scanner against this
+# component repo. Per Security/definitions/ENFORCEMENT.md, this gate is
+# warn-only at Stage 1: critical/major findings print to the run log but
+# the job does not block PRs. Stage 4 cutover (org-level) flips
+# `continue-on-error` off and promotes CRITICAL/MAJOR to hard fail.
+#
+# Cross-repo wiring: this workflow checks out the Security repo as a
+# sibling and invokes its predicate scanner. The scanner reads
+# `S2FORGE_ROOT` to locate component sources — set to the component
+# checkout so components are scanned in place.
+#
+# Setup required (one-time, org-level):
+#   Set repo or org-level variable SECURITY_REPO to "<org>/<security-repo>"
+#   (e.g. "Sparks-Foundry/security"). If the Security repo is private,
+#   also set a secret SECURITY_REPO_TOKEN to a PAT with read access.
+# Without SECURITY_REPO set, the job no-ops with a warning — no false fail.
+
+name: DEF-* convention audit
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  def-audit:
+    name: Run DEF-* predicate scan
+    runs-on: ubuntu-latest
+    continue-on-error: true  # Stage 1: warn-only
+    steps:
+      - name: Checkout this component repo
+        uses: actions/checkout@v4
+        with:
+          path: component
+
+      - name: Resolve Security repo target
+        id: sec
+        env:
+          SECURITY_REPO: ${{ vars.SECURITY_REPO }}
+        run: |
+          if [ -z "${SECURITY_REPO:-}" ]; then
+            echo "::warning::SECURITY_REPO not set — skipping DEF-* audit. Set repo or org variable SECURITY_REPO to <org>/<repo> to enable."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+            echo "repo=${SECURITY_REPO}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Checkout Security repo
+        if: steps.sec.outputs.skip != 'true'
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ steps.sec.outputs.repo }}
+          token: ${{ secrets.SECURITY_REPO_TOKEN || github.token }}
+          path: Security
+
+      - name: Set up Python
+        if: steps.sec.outputs.skip != 'true'
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Run DEF-* predicate scan
+        if: steps.sec.outputs.skip != 'true'
+        env:
+          S2FORGE_ROOT: ${{ github.workspace }}/component
+          S2FORGE_SCAN_DIR: ${{ github.workspace }}/.scan-out
+        run: |
+          mkdir -p "$S2FORGE_SCAN_DIR"
+          # The scanner reads components.txt; for a per-repo run, discover
+          # components by finding src/main.rs entries under the component
+          # repo and emit a synthetic components.txt that points at them.
+          (
+            cd component
+            find . -mindepth 2 -maxdepth 5 -name main.rs -path "*/src/main.rs" \
+              | sed "s|^\./||; s|/src/main.rs$||" \
+              | sort
+          ) > "$S2FORGE_SCAN_DIR/components.txt"
+          echo "Components discovered:"
+          sed "s/^/  /" "$S2FORGE_SCAN_DIR/components.txt"
+          if [ ! -s "$S2FORGE_SCAN_DIR/components.txt" ]; then
+            echo "::notice::No Rust components (src/main.rs) found in this repo — DEF-* gate is a no-op here."
+            exit 0
+          fi
+          export S2FORGE_COMPONENTS="$S2FORGE_SCAN_DIR/components.txt"
+          python3 Security/definitions/def_predicate_scan.py || true
+
+      - name: Gate on severity
+        if: steps.sec.outputs.skip != 'true'
+        env:
+          S2FORGE_SCAN_DIR: ${{ github.workspace }}/.scan-out
+        run: |
+          python3 - <<'PY'
+          import json, os, sys
+          path = os.path.join(os.environ.get("S2FORGE_SCAN_DIR", ".scan-out"), "findings.jsonl")
+          if not os.path.exists(path):
+              print("No findings.jsonl produced; nothing to gate.")
+              sys.exit(0)
+          critical = major = minor = insig = 0
+          with open(path) as f:
+              for line in f:
+                  if not line.strip():
+                      continue
+                  r = json.loads(line)
+                  sev = r.get("severity", "").lower()
+                  if sev == "critical":
+                      critical += 1
+                  elif sev == "major":
+                      major += 1
+                  elif sev == "minor":
+                      minor += 1
+                  else:
+                      insig += 1
+          print(f"DEF-* findings — critical={critical} major={major} minor={minor} insignificant={insig}")
+          if critical > 0 or major > 0:
+              print("::warning::DEF-* gate would fail at Stage 4 (CRITICAL/MAJOR found). Warn-only at Stage 1.")
+              sys.exit(1)
+          PY
