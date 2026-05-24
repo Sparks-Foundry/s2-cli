@@ -19,6 +19,27 @@ struct ControlPlane {
     live_runtimes: Vec<Runtime>,
     #[serde(default)]
     scaffolded_runtimes: Vec<Runtime>,
+    #[serde(default)]
+    product_services: Vec<ProductService>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+struct ProductService {
+    name: String,
+    port: u16,
+    product: String,
+    #[serde(default = "default_health_path")]
+    health_path: String,
+    /// Full path to probe for auth-gate (e.g. "/coach/oauth/google/start"). None = skip.
+    #[serde(default)]
+    probe: Option<String>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    auth: Option<String>,
+}
+
+fn default_health_path() -> String {
+    "/health".to_string()
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -40,6 +61,10 @@ struct Runtime {
     language: String,
     #[serde(default)]
     gaps: Vec<String>,
+    #[serde(default)]
+    tools: Vec<String>,
+    #[serde(default)]
+    auth: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -74,6 +99,11 @@ enum Commands {
         #[arg(short, long, default_value_t = 4000)]
         port: u16,
     },
+    /// Run behavioral smoke tests against live services to catch regressions
+    Verify {
+        /// Name or substring to filter services (e.g. "snack", "text-runtime"). Omit for all live services.
+        filter: Option<String>,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -104,6 +134,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Commands::Health { name } => cmd_health(&name).await?,
         Commands::Gaps => cmd_gaps().await?,
         Commands::Watch { port } => cmd_watch(port).await?,
+        Commands::Verify { filter } => {
+            let any_failed = cmd_verify(filter.as_deref()).await?;
+            if any_failed {
+                std::process::exit(1);
+            }
+        }
     }
 
     Ok(())
@@ -550,6 +586,248 @@ async fn cmd_gaps() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Verify command — behavioral smoke tests
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone)]
+enum CheckResult {
+    Pass(String),
+    Fail(String),
+    Skip(String),
+}
+
+impl CheckResult {
+    fn display(&self) -> ColoredString {
+        match self {
+            CheckResult::Pass(msg) => format!("✓  {msg}").green(),
+            CheckResult::Fail(msg) => format!("✗  {msg}").red().bold(),
+            CheckResult::Skip(msg) => format!("–  {msg}").dimmed(),
+        }
+    }
+
+    fn is_fail(&self) -> bool {
+        matches!(self, CheckResult::Fail(_))
+    }
+}
+
+async fn verify_liveness(client: &reqwest::Client, port: u16, health_path: &str) -> CheckResult {
+    let url = format!("http://localhost:{port}{health_path}");
+    match client.get(&url).send().await {
+        Ok(r) if r.status().is_success() => CheckResult::Pass(r.status().to_string()),
+        Ok(r) => CheckResult::Fail(format!("unexpected status {}", r.status())),
+        Err(e) if e.is_connect() => CheckResult::Fail("connection refused".to_string()),
+        Err(e) if e.is_timeout() => CheckResult::Fail("timeout".to_string()),
+        Err(e) => CheckResult::Fail(e.to_string()),
+    }
+}
+
+// Probe an authenticated endpoint without a token — expect 401 or 403.
+// A 200 means auth is being bypassed; a 5xx means middleware is crashing.
+async fn verify_auth_gate(client: &reqwest::Client, port: u16, probe_path: &str) -> CheckResult {
+    let url = format!("http://localhost:{port}{probe_path}");
+    match client.post(&url).send().await {
+        Ok(r) => {
+            let s = r.status().as_u16();
+            if s == 401 || s == 403 {
+                CheckResult::Pass(format!("{s} (auth rejected as expected)"))
+            } else if s == 404 {
+                // Endpoint doesn't exist at that path — not a security issue, just wrong path.
+                CheckResult::Skip(format!("404 on {probe_path} — endpoint path may differ"))
+            } else if s >= 500 {
+                CheckResult::Fail(format!(
+                    "{s} — middleware may be panicking on unauthenticated requests"
+                ))
+            } else {
+                CheckResult::Fail(format!(
+                    "{s} — expected 401/403; auth may be bypassed or disabled"
+                ))
+            }
+        }
+        Err(e) if e.is_connect() => CheckResult::Skip("service not running".to_string()),
+        Err(e) if e.is_timeout() => CheckResult::Fail("timeout".to_string()),
+        Err(e) => CheckResult::Fail(e.to_string()),
+    }
+}
+
+async fn verify_manifest(client: &reqwest::Client, port: u16) -> CheckResult {
+    let url = format!("http://localhost:{port}/v1/control/manifest");
+    match client.get(&url).send().await {
+        Ok(r) if r.status().is_success() => {
+            let body = r.text().await.unwrap_or_default();
+            if serde_json::from_str::<Value>(&body).is_ok() {
+                CheckResult::Pass("200 OK, valid JSON".to_string())
+            } else {
+                CheckResult::Fail("200 OK but response is not valid JSON".to_string())
+            }
+        }
+        Ok(r) if r.status() == 404 => CheckResult::Skip("endpoint not exposed".to_string()),
+        Ok(r) if r.status() == 401 || r.status() == 403 => {
+            CheckResult::Skip("requires auth (not probing further)".to_string())
+        }
+        Ok(r) => CheckResult::Fail(format!("unexpected status {}", r.status())),
+        Err(e) if e.is_connect() => CheckResult::Skip("service not running".to_string()),
+        Err(e) if e.is_timeout() => CheckResult::Fail("timeout".to_string()),
+        Err(e) => CheckResult::Fail(e.to_string()),
+    }
+}
+
+struct ServiceCheck<'a> {
+    name: &'a str,
+    port: u16,
+    /// Full path for liveness probe, e.g. "/health" or "/v1/fleet/status".
+    health_path: &'a str,
+    /// Full path for auth-gate probe, e.g. "/v1/generate_text" or "/coach/oauth/google/start".
+    /// None = skip auth-gate for this service.
+    probe_path: Option<String>,
+}
+
+async fn run_checks(svc: ServiceCheck<'_>, client: &reqwest::Client) -> (String, bool) {
+    let liveness = verify_liveness(client, svc.port, svc.health_path).await;
+
+    let auth = if let Some(ref path) = svc.probe_path {
+        verify_auth_gate(client, svc.port, path).await
+    } else {
+        CheckResult::Skip("no auth probe declared".to_string())
+    };
+
+    let manifest = verify_manifest(client, svc.port).await;
+
+    let any_fail = liveness.is_fail() || auth.is_fail() || manifest.is_fail();
+
+    let header = if any_fail {
+        format!("── {} ─", svc.name).red().bold().to_string()
+    } else {
+        format!("── {} ─", svc.name).bold().to_string()
+    };
+
+    let block = format!(
+        "{header}\n  {:<12} {}\n  {:<12} {}\n  {:<12} {}",
+        "liveness",
+        liveness.display(),
+        "auth-gate",
+        auth.display(),
+        "manifest",
+        manifest.display(),
+    );
+
+    (block, any_fail)
+}
+
+async fn cmd_verify(filter: Option<&str>) -> Result<bool, Box<dyn std::error::Error>> {
+    let cp = load_control_plane()?;
+
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(3))
+        .build()?;
+
+    let f_lower = filter.map(|f| f.to_lowercase());
+    let matches = |name: &str, product: Option<&str>| -> bool {
+        match &f_lower {
+            None => true,
+            Some(f) => {
+                name.to_lowercase().contains(f.as_str())
+                    || product.map(|p| p.to_lowercase().contains(f.as_str())).unwrap_or(false)
+            }
+        }
+    };
+
+    let runtimes: Vec<&Runtime> = cp
+        .live_runtimes
+        .iter()
+        .filter(|r| matches(&r.name, None))
+        .collect();
+
+    let product_svcs: Vec<&ProductService> = cp
+        .product_services
+        .iter()
+        .filter(|p| matches(&p.name, Some(&p.product)))
+        .collect();
+
+    if runtimes.is_empty() && product_svcs.is_empty() && filter.is_some() {
+        eprintln!(
+            "{} no services match '{}'",
+            "error:".red().bold(),
+            filter.unwrap()
+        );
+        return Ok(true);
+    }
+
+    let label = match filter {
+        Some(f) => format!("VERIFY: {f}"),
+        None => "VERIFY: all live runtimes".to_string(),
+    };
+    println!("\n{}", format!("── {label} ──────────────────────────────────────────────").bold());
+
+    let runtime_futures: Vec<_> = runtimes
+        .iter()
+        .map(|r| {
+            let client = &client;
+            let skip_auth = r
+                .auth
+                .as_deref()
+                .map(|a| a.contains("internal-only"))
+                .unwrap_or(false);
+            let probe_path = if skip_auth {
+                None
+            } else {
+                r.tools.first().map(|t| format!("/v1/{t}"))
+            };
+            let svc = ServiceCheck {
+                name: &r.name,
+                port: r.port,
+                health_path: "/health",
+                probe_path,
+            };
+            run_checks(svc, client)
+        })
+        .collect();
+
+    let product_futures: Vec<_> = product_svcs
+        .iter()
+        .map(|p| {
+            let client = &client;
+            let svc = ServiceCheck {
+                name: &p.name,
+                port: p.port,
+                health_path: &p.health_path,
+                probe_path: p.probe.clone(),
+            };
+            run_checks(svc, client)
+        })
+        .collect();
+
+    let (runtime_results, product_results) =
+        tokio::join!(join_all(runtime_futures), join_all(product_futures));
+    let results: Vec<_> = runtime_results.into_iter().chain(product_results).collect();
+
+    let mut any_failed = false;
+    for (block, failed) in &results {
+        println!("{block}");
+        if *failed {
+            any_failed = true;
+        }
+    }
+
+    println!();
+    let total = results.len();
+    let failed_count = results.iter().filter(|(_, f)| *f).count();
+
+    if failed_count == 0 {
+        println!(
+            "{}",
+            format!("  all {total} services passed").green().bold()
+        );
+    } else {
+        println!(
+            "{}",
+            format!("  {failed_count}/{total} services have failing checks").red().bold()
+        );
+    }
+
+    Ok(any_failed)
 }
 
 async fn cmd_watch(port: u16) -> Result<(), Box<dyn std::error::Error>> {
