@@ -42,6 +42,22 @@ cargo run -- health text-runtime
 cargo run -- health coach-broker
 ```
 
+### Worktree
+
+Manage git worktrees for the monorepo-per-category repos (the **clean-main-is-sacred**
+discipline — see `/WORKFLOW.md`). Keeps each category's `main` checkout clean and deployable
+while in-progress work lives in `.wt/<category>--<name>` beside it.
+
+```bash
+s2 worktree add generation vision-fix      # new branch feat/vision-fix in .wt/generation--vision-fix
+s2 worktree add compute --at <sha>         # detached worktree at a commit (hotfix on the running SHA)
+s2 worktree ls                             # list linked worktrees across all category repos
+s2 worktree rm generation vision-fix       # remove + prune
+```
+
+On `add` it creates a shared per-category build-cache dir and prints the `CARGO_TARGET_DIR`
+export and `railway link` command to run in the new worktree.
+
 ### Verify
 
 Behavioral smoke tests — runs three checks against each matched service concurrently and exits non-zero if any fail. Intended for post-deploy validation.

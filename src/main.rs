@@ -104,6 +104,32 @@ enum Commands {
         /// Name or substring to filter services (e.g. "snack", "text-runtime"). Omit for all live services.
         filter: Option<String>,
     },
+    /// Manage git worktrees for category repos (clean-main-is-sacred — see /WORKFLOW.md)
+    Worktree {
+        #[command(subcommand)]
+        action: WorktreeAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum WorktreeAction {
+    /// Add a worktree for <category> on a new branch feat/<name> (or detached at --at <sha>)
+    Add {
+        /// Category repo name (e.g. "generation", "compute", "state")
+        category: String,
+        /// Short work name; becomes branch feat/<name> and dir .wt/<category>--<name>
+        name: String,
+        /// Detach at a commit/SHA instead of creating a branch (hotfix on the running commit)
+        #[arg(long)]
+        at: Option<String>,
+    },
+    /// List worktrees across all category repos
+    Ls,
+    /// Remove a worktree and prune
+    Rm {
+        category: String,
+        name: String,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -140,8 +166,214 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 std::process::exit(1);
             }
         }
+        Commands::Worktree { action } => cmd_worktree(action)?,
     }
 
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Worktree command — clean-main-is-sacred (see /WORKFLOW.md)
+// ---------------------------------------------------------------------------
+
+/// Walk up from CWD to the fleet root (the dir holding both Systems/ and Products/).
+fn find_fleet_root() -> Result<PathBuf, String> {
+    if let Ok(p) = env::var("S2_FLEET_ROOT") {
+        let path = PathBuf::from(&p);
+        if path.join("Systems").is_dir() {
+            return Ok(path);
+        }
+    }
+    let mut current = env::current_dir().map_err(|e| e.to_string())?;
+    loop {
+        if current.join("Systems/Runtimes").is_dir() && current.join("Products").is_dir() {
+            return Ok(current);
+        }
+        if !current.pop() {
+            break;
+        }
+    }
+    Err("fleet root not found (no ancestor with Systems/Runtimes + Products) — set S2_FLEET_ROOT".into())
+}
+
+/// Resolve a category name to its repo dir. Tries Systems/Runtimes/<cat> then Systems/<cat>.
+fn resolve_category_repo(root: &Path, category: &str) -> Result<PathBuf, String> {
+    for c in [
+        root.join("Systems/Runtimes").join(category),
+        root.join("Systems").join(category),
+    ] {
+        if c.join(".git").exists() {
+            return Ok(c);
+        }
+    }
+    Err(format!(
+        "category repo '{category}' not found under Systems/Runtimes/ or Systems/ (no .git there)"
+    ))
+}
+
+fn run_git(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let status = std::process::Command::new("git").args(args).status()?;
+    if !status.success() {
+        return Err(format!("git {} exited with failure", args.join(" ")).into());
+    }
+    Ok(())
+}
+
+fn cmd_worktree(action: WorktreeAction) -> Result<(), Box<dyn std::error::Error>> {
+    let root = find_fleet_root().map_err(|e| format!("worktree: {e}"))?;
+    match action {
+        WorktreeAction::Add { category, name, at } => {
+            worktree_add(&root, &category, &name, at.as_deref())
+        }
+        WorktreeAction::Ls => worktree_ls(&root),
+        WorktreeAction::Rm { category, name } => worktree_rm(&root, &category, &name),
+    }
+}
+
+fn worktree_add(
+    root: &Path,
+    category: &str,
+    name: &str,
+    at: Option<&str>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let repo = resolve_category_repo(root, category)?;
+    let parent = repo
+        .parent()
+        .ok_or("category repo has no parent directory")?;
+    let wt_dir = parent.join(".wt").join(format!("{category}--{name}"));
+    if wt_dir.exists() {
+        return Err(format!("worktree already exists: {}", wt_dir.display()).into());
+    }
+    std::fs::create_dir_all(parent.join(".wt"))?;
+
+    let repo_s = repo.to_string_lossy().to_string();
+    let wt_s = wt_dir.to_string_lossy().to_string();
+    let mut args = vec![
+        "-C".to_string(),
+        repo_s,
+        "worktree".to_string(),
+        "add".to_string(),
+    ];
+    match at {
+        Some(sha) => {
+            args.push("--detach".to_string());
+            args.push(wt_s);
+            args.push(sha.to_string());
+        }
+        None => {
+            args.push("-b".to_string());
+            args.push(format!("feat/{name}"));
+            args.push(wt_s);
+        }
+    }
+    run_git(&args)?;
+
+    // Shared per-category build cache (avoids a cold Rust target/ per worktree).
+    let cache = parent.join(".wt").join(".cargo-target").join(category);
+    let _ = std::fs::create_dir_all(&cache);
+
+    println!("{} {}", "worktree:".green().bold(), wt_dir.display());
+    match at {
+        Some(sha) => println!("  {} detached at {sha}", "branch:".dimmed()),
+        None => println!("  {} feat/{name}", "branch:".dimmed()),
+    }
+    println!("  {} cd {}", "next:".dimmed(), wt_dir.display());
+    println!(
+        "       {} {}",
+        "export CARGO_TARGET_DIR=".dimmed(),
+        cache.display()
+    );
+    println!(
+        "       {}",
+        "railway link --project <id> --service <svc> --environment production".dimmed()
+    );
+    Ok(())
+}
+
+fn worktree_ls(root: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    println!("{}", "\n── WORKTREES ──────────────────────────────────────────────────".bold());
+    let mut search_dirs = vec![root.join("Systems/Runtimes"), root.join("Systems")];
+    search_dirs.retain(|d| d.is_dir());
+
+    let mut found_any = false;
+    for base in &search_dirs {
+        let entries = match std::fs::read_dir(base) {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        for entry in entries.flatten() {
+            let repo = entry.path();
+            if !repo.join(".git").exists() {
+                continue;
+            }
+            let out = std::process::Command::new("git")
+                .args(["-C", &repo.to_string_lossy(), "worktree", "list", "--porcelain"])
+                .output();
+            let Ok(out) = out else { continue };
+            let text = String::from_utf8_lossy(&out.stdout);
+            // Each worktree block starts with "worktree <path>"; the first is the main checkout.
+            let mut paths: Vec<&str> = text
+                .lines()
+                .filter_map(|l| l.strip_prefix("worktree "))
+                .collect();
+            if paths.len() <= 1 {
+                continue; // only the main checkout, no linked worktrees
+            }
+            let cat = repo.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
+            // Skip the first (main checkout); print the rest.
+            paths.remove(0);
+            for p in paths {
+                println!("  {:<14} {}", cat.yellow(), p);
+                found_any = true;
+            }
+        }
+    }
+    if !found_any {
+        println!("  {}", "no linked worktrees — every main checkout is clean".dimmed());
+    }
+    Ok(())
+}
+
+fn worktree_rm(root: &Path, category: &str, name: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let repo = resolve_category_repo(root, category)?;
+    let parent = repo.parent().ok_or("category repo has no parent directory")?;
+    let wt_dir = parent.join(".wt").join(format!("{category}--{name}"));
+    let repo_s = repo.to_string_lossy().to_string();
+    run_git(&[
+        "-C".to_string(),
+        repo_s.clone(),
+        "worktree".to_string(),
+        "remove".to_string(),
+        wt_dir.to_string_lossy().to_string(),
+    ])?;
+    run_git(&[
+        "-C".to_string(),
+        repo_s.clone(),
+        "worktree".to_string(),
+        "prune".to_string(),
+    ])?;
+    println!("{} removed {}", "worktree:".green().bold(), wt_dir.display());
+
+    // Safe-delete the feat/<name> branch the worktree was created on. `-d` refuses to
+    // delete unmerged branches, so this never loses work — it just clears merged cruft.
+    let branch = format!("feat/{name}");
+    let out = std::process::Command::new("git")
+        .args(["-C", &repo_s, "branch", "-d", &branch])
+        .output();
+    match out {
+        Ok(o) if o.status.success() => {
+            println!("  {} {branch}", "branch deleted:".dimmed());
+        }
+        Ok(_) => {
+            // Unmerged or detached (no such branch) — leave it and tell the operator.
+            println!(
+                "  {} {branch} kept (unmerged or detached) — `git -C {} branch -D {branch}` to force",
+                "note:".yellow(),
+                repo_s
+            );
+        }
+        Err(_) => {}
+    }
     Ok(())
 }
 
